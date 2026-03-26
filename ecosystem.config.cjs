@@ -12,7 +12,9 @@ module.exports = {
         TARGET_BASE_URL: process.env.TARGET_BASE_URL || "",
         TARGET_API_KEY: process.env.TARGET_API_KEY || "",
         SHIM_API_KEY: process.env.SHIM_API_KEY || "",
-        DEFAULT_MODEL: process.env.DEFAULT_MODEL || "gpt-5.4"
+        DEFAULT_MODEL: process.env.DEFAULT_MODEL || "gpt-5.4",
+        STRIP_FIELDS: process.env.STRIP_FIELDS || "audio",
+        DEBUG_CAPTURE_DIR: process.env.DEBUG_CAPTURE_DIR || ""
       }
     }
   ]
