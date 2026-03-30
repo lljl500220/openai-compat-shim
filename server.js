@@ -15,6 +15,9 @@ const STRIP_FIELDS = String(process.env.STRIP_FIELDS || "audio")
   .filter(Boolean);
 const DEBUG_CAPTURE_DIR = process.env.DEBUG_CAPTURE_DIR || "";
 
+// 这个 shim 的核心职责是把客户端发来的近似 OpenAI 请求，
+// 适配成上游网关更稳定能接受的格式，再把响应按兼容预期返回。
+
 // Send a small JSON response with a consistent content type.
 function sendJson(res, status, payload) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -293,6 +296,8 @@ function normalizeInputItemToChatMessages(item) {
     return [normalizeChatMessage(item)];
   }
 
+  // responses 风格的 function_call 要还原成 assistant + tool_calls，
+  // 这样转到 /chat/completions 时才能保留代理循环上下文。
   if (item.type === "function_call") {
     return [
       normalizeChatMessage({
@@ -312,6 +317,8 @@ function normalizeInputItemToChatMessages(item) {
     ];
   }
 
+  // custom_tool_call 也统一映射成 function tool 调用；
+  // 这里把 input 折叠到 arguments，方便上游按 chat.completions 习惯处理。
   if (item.type === "custom_tool_call") {
     return [
       normalizeChatMessage({
@@ -334,6 +341,7 @@ function normalizeInputItemToChatMessages(item) {
     ];
   }
 
+  // tool 输出要落成 role=tool 的消息，继续串起下一轮模型推理。
   if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
     return [
       normalizeChatMessage({
@@ -421,6 +429,8 @@ function normalizeResponseInput(input) {
   return input;
 }
 
+// 某些 custom tool 在上游返回时会把原始字符串包成 {"input":"..."}；
+// 这里在返回客户端前把外层壳拆掉，恢复成客户端更熟悉的 raw string 形式。
 function unwrapCustomToolArguments(name, argumentsText, customToolNames) {
   if (!customToolNames.has(name) || typeof argumentsText !== "string") {
     return argumentsText;
@@ -432,6 +442,7 @@ function unwrapCustomToolArguments(name, argumentsText, customToolNames) {
   return argumentsText;
 }
 
+// 非流式 chat.completions 返回值修正：只在命中 custom tool 时拆包 arguments。
 function transformChatCompletionJson(text, customToolNames) {
   const payload = tryParseJson(text);
   if (!payload || payload.object !== "chat.completion") {
@@ -464,6 +475,8 @@ function makeChunkFromTemplate(template, choice) {
   };
 }
 
+// 流式返回更麻烦：tool_calls 可能被拆在多个 SSE chunk 里，
+// 所以要先聚合 name/arguments，再按客户端能消费的方式重新拼回去。
 function transformChatCompletionSse(text, customToolNames) {
   const rawText = String(text || "");
   if (!rawText.includes("tool_calls")) return rawText;
@@ -498,6 +511,8 @@ function transformChatCompletionSse(text, customToolNames) {
   const passthroughEvents = [];
   const trailingEvents = [];
   let templateChunk = null;
+
+  // 第一遍扫描：保留普通文本增量，同时把分片 tool_calls 累积到 toolStates。
 
   for (const event of parsedEvents) {
     if (event.kind !== "json") {
@@ -592,6 +607,7 @@ function transformChatCompletionSse(text, customToolNames) {
     return rawText;
   }
 
+  // 第二遍输出：先透传原始非 tool 内容，再补回聚合后的 tool call 事件。
   const output = [];
   for (const event of passthroughEvents) {
     if (event.kind === "json") {
@@ -674,6 +690,7 @@ function transformChatCompletionSse(text, customToolNames) {
 function adaptPayload(pathname, body) {
   const payload = body && typeof body === "object" ? cloneJson(body) : {};
 
+  // 可配置剥离一些上游不兼容、或当前 shim 不想透传的字段。
   for (const field of STRIP_FIELDS) {
     delete payload[field];
   }
@@ -689,6 +706,7 @@ function adaptPayload(pathname, body) {
       payload.tools = normalizeChatTools(payload.tools);
     }
 
+    // 优先保留原始 messages；如果客户端发的是 input，再尝试无损转成 messages。
     const normalizedMessages = normalizeMessages(payload.messages);
     if (normalizedMessages.length > 0) {
       payload.messages = normalizedMessages;
@@ -737,6 +755,7 @@ function readRequestBody(req) {
 
 // Forward the adapted request upstream and preserve either JSON or SSE streaming behavior.
 async function proxyJson(req, res, pathname) {
+  // 这里是一次 POST 代理请求的总入口：读 body -> 改 payload -> 发上游 -> 回客户端。
   if (!TARGET_BASE_URL || !TARGET_API_KEY) {
     return sendJson(res, 500, {
       error: {
@@ -772,6 +791,8 @@ async function proxyJson(req, res, pathname) {
     body?.stream === true ||
     body?.stream_options != null ||
     acceptHeader.includes("text/event-stream");
+
+  // 兼容几种常见的流式信号：显式 stream、stream_options、或 Accept: text/event-stream。
 
   logEvent({
     phase: "proxy_request",
@@ -848,6 +869,7 @@ async function proxyJson(req, res, pathname) {
       pathname.endsWith("/chat/completions") && customToolNames.size > 0;
 
     if (shouldTransformStream) {
+      // custom tool 的 SSE 分片需要先读完整再重写，否则客户端可能拿到不完整 arguments。
       const streamedChunks = [];
       upstreamResponse.stream.on("data", (chunk) => {
         streamedChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
@@ -889,6 +911,7 @@ async function proxyJson(req, res, pathname) {
       return;
     }
 
+    // 普通流式场景直接透传，尽量不打断上游的实时输出节奏。
     res.writeHead(upstreamResponse.status, {
       "Content-Type": upstreamResponse.headers["content-type"] || "text/event-stream; charset=utf-8",
       "Cache-Control": upstreamResponse.headers["cache-control"] || "no-cache",
@@ -929,6 +952,7 @@ async function proxyJson(req, res, pathname) {
 
   let text = upstreamResponse.text;
   if (pathname.endsWith("/chat/completions") && customToolNames.size > 0) {
+    // 非流式场景下只需要对完整 JSON 做一次 tool arguments 拆包修正。
     text = transformChatCompletionJson(text, customToolNames);
   }
   logEvent({
@@ -986,6 +1010,7 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  // 只给 /v1/* 做鉴权，便于健康检查和基础探活接口无需携带密钥。
   if (SHIM_API_KEY && pathname.startsWith("/v1/")) {
     const token = readBearerToken(req);
     if (token !== SHIM_API_KEY) {
@@ -1016,6 +1041,7 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  // 真实代理入口只开放两个 POST API：chat.completions 和 responses。
   if (req.method === "POST" && (pathname === "/v1/chat/completions" || pathname === "/v1/responses")) {
     return proxyJson(req, res, pathname);
   }

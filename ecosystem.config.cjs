@@ -14,7 +14,11 @@ module.exports = {
         SHIM_API_KEY: process.env.SHIM_API_KEY || "",
         DEFAULT_MODEL: process.env.DEFAULT_MODEL || "gpt-5.4",
         STRIP_FIELDS: process.env.STRIP_FIELDS || "audio",
-        DEBUG_CAPTURE_DIR: process.env.DEBUG_CAPTURE_DIR || ""
+        DEBUG_CAPTURE_DIR: process.env.DEBUG_CAPTURE_DIR || "",
+        NODE_USE_ENV_PROXY: process.env.NODE_USE_ENV_PROXY || "1",
+        HTTP_PROXY: process.env.HTTP_PROXY || "",
+        HTTPS_PROXY: process.env.HTTPS_PROXY || "",
+        NO_PROXY: process.env.NO_PROXY || "127.0.0.1,localhost"
       }
     }
   ]

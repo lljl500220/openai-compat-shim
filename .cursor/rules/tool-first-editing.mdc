@@ -1,0 +1,30 @@
+---
+description: Force tool-first editing and avoid shell-based file writes
+alwaysApply: true
+---
+
+# Tool-First Editing
+
+- Prefer dedicated tools over shell whenever an equivalent tool exists.
+- For reading files, use `ReadFile`.
+- For searching, use `rg` or `Glob`.
+- For lint diagnostics, use `ReadLints`.
+- For file edits, use `ApplyPatch` or another dedicated editor tool first.
+
+# Shell Restrictions
+
+- Do not use `Shell` to edit, create, rewrite, or patch files when a dedicated editing tool is available.
+- This includes `python` file writes, `sed -i`, `perl -pi`, `cat > file`, `tee`, heredoc redirection, or any command that mutates file contents.
+- Do not switch to `Shell` just because it seems faster or easier.
+
+# Fallback Rule
+
+- Only fall back to `Shell` for file mutation if the dedicated editing tool has already failed in the current turn with a real tool error.
+- Before falling back, state the exact tool failure briefly.
+- If fallback is unavoidable, make the smallest possible targeted change and return to dedicated tools for later edits.
+
+# Required Behavior
+
+- Do not claim that an editing tool failed unless the tool response explicitly shows the failure.
+- Do not wrap `ApplyPatch` content in extra JSON when the tool expects raw patch text.
+- If the task is an edit task, prefer a short retry with the correct editing tool shape before using shell.

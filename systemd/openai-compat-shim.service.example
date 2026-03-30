@@ -1,0 +1,23 @@
+[Unit]
+Description=OpenAI Compat Shim
+After=network-online.target mihomo.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shim
+Group=shim
+WorkingDirectory=/opt/openai-compat-shim
+EnvironmentFile=/etc/openai-compat-shim.env
+Environment=NODE_ENV=production
+Environment=NODE_USE_ENV_PROXY=1
+Environment=HTTP_PROXY=http://127.0.0.1:7892
+Environment=HTTPS_PROXY=http://127.0.0.1:7892
+Environment=NO_PROXY=127.0.0.1,localhost
+ExecStart=/usr/bin/node /opt/openai-compat-shim/server.js
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

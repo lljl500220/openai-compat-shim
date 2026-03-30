@@ -322,6 +322,10 @@ Environment variables:
 - `DEFAULT_MODEL`: fallback model exposed by `/v1/models`
 - `STRIP_FIELDS`: comma-separated top-level request fields to remove before proxying
 - `DEBUG_CAPTURE_DIR`: directory for full request/response capture files
+- `NODE_USE_ENV_PROXY`: set to `1` so built-in Node.js `http` / `https` requests honor proxy environment variables
+- `HTTP_PROXY`: outbound HTTP proxy, for example `http://127.0.0.1:7892`
+- `HTTPS_PROXY`: outbound HTTPS proxy, for example `http://127.0.0.1:7892`
+- `NO_PROXY`: addresses that should bypass the proxy, for example `127.0.0.1,localhost`
 
 Example:
 
@@ -333,6 +337,10 @@ SHIM_API_KEY=replace-with-your-own-secret
 DEFAULT_MODEL=gpt-5.4
 STRIP_FIELDS=audio
 DEBUG_CAPTURE_DIR=
+NODE_USE_ENV_PROXY=1
+HTTP_PROXY=http://127.0.0.1:7892
+HTTPS_PROXY=http://127.0.0.1:7892
+NO_PROXY=127.0.0.1,localhost
 ```
 
 ## Local run
@@ -354,6 +362,82 @@ The PM2 config also passes through:
 
 - `STRIP_FIELDS`
 - `DEBUG_CAPTURE_DIR`
+- `NODE_USE_ENV_PROXY`
+- `HTTP_PROXY`
+- `HTTPS_PROXY`
+- `NO_PROXY`
+
+## Route upstream traffic through a local proxy on the server
+
+If the server reaches `gmncode.cn` much more slowly than your local machine, the most reliable fix is to route outbound traffic through a local proxy instead of changing the application protocol.
+
+Recommended setup:
+
+- run `mihomo` core on the server, not the `Clash Verge Rev` desktop GUI
+- let `mihomo` fetch nodes from your subscription
+- expose a local proxy port such as `127.0.0.1:7892`
+- let this shim reach the upstream via `NODE_USE_ENV_PROXY=1` plus `HTTP_PROXY` / `HTTPS_PROXY`
+
+Why this works:
+
+- `Clash Verge Rev` is a desktop GUI client, not a good fit for a headless server
+- this project uses built-in Node.js `http` / `https`
+- starting from Node.js `v22.21.0`, built-in requests can honor proxy environment variables when `NODE_USE_ENV_PROXY=1` is enabled
+
+References:
+
+- Node.js enterprise network configuration: <https://nodejs.org/en/learn/http/enterprise-network-configuration>
+- Mihomo service docs: <https://wiki.metacubex.one/en/startup/service/>
+- Mihomo proxy-providers docs: <https://wiki.metacubex.one/en/config/proxy-providers/>
+
+### 1. Prepare Mihomo config
+
+The repo includes a sample file:
+
+- [deploy/mihomo/config.yaml.example](./deploy/mihomo/config.yaml.example)
+
+Replace the subscription URL with your own link.
+
+### 2. Verify the proxy really improves upstream access
+
+On the server, first verify that Mihomo can reach the upstream from its local proxy:
+
+```bash
+curl -x http://127.0.0.1:7892 -I https://gmncode.cn/
+```
+
+Only after this is clearly faster or more stable than direct access should the shim be pointed at the proxy.
+
+### 3. Make the shim use the local proxy
+
+Configure `.env` like this:
+
+```bash
+PORT=8787
+TARGET_BASE_URL=https://gmncode.cn/v1
+TARGET_API_KEY=sk-xxxx
+SHIM_API_KEY=replace-with-your-own-secret
+DEFAULT_MODEL=gpt-5.4
+STRIP_FIELDS=audio
+DEBUG_CAPTURE_DIR=
+NODE_USE_ENV_PROXY=1
+HTTP_PROXY=http://127.0.0.1:7892
+HTTPS_PROXY=http://127.0.0.1:7892
+NO_PROXY=127.0.0.1,localhost
+```
+
+### 4. Deploy with systemd
+
+The repo includes a sample unit:
+
+- [systemd/openai-compat-shim.service.example](./systemd/openai-compat-shim.service.example)
+
+Key points:
+
+- `After=mihomo.service` so the proxy core starts first
+- `EnvironmentFile=/etc/openai-compat-shim.env`
+- `NODE_USE_ENV_PROXY=1`
+- `HTTP_PROXY` / `HTTPS_PROXY` point at the local Mihomo port
 
 ## Example requests
 
@@ -498,6 +582,25 @@ Check:
    - client request shape
    - shim adaptation
    - upstream compatibility
+   - server outbound network quality
+
+### 5. Network-first troubleshooting order
+
+If the server is much worse than your local machine, check the network path first instead of blaming the agent protocol.
+
+Order:
+
+1. test direct access to `gmncode.cn` from the server
+2. test access through the local `mihomo` proxy
+3. compare `time_total`, TLS handshake, and TTFB
+4. only if the network layer looks fine should you continue with shim captures
+
+Example:
+
+```bash
+curl -o /dev/null -s -w 'direct dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\n' https://gmncode.cn/v1/models
+curl -o /dev/null -s -x http://127.0.0.1:7892 -w 'proxy  dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\n' https://gmncode.cn/v1/models
+```
 
 ## Deployment topology
 

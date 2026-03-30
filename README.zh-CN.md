@@ -322,6 +322,10 @@ cp .env.example .env
 - `DEFAULT_MODEL`: `/v1/models` 暴露的默认回退模型名
 - `STRIP_FIELDS`: 代理前需要剥离的顶层请求字段，多个值用逗号分隔
 - `DEBUG_CAPTURE_DIR`: 保存完整请求/响应抓取文件的目录
+- `NODE_USE_ENV_PROXY`: 设为 `1` 后，Node.js 会让内置 `http` / `https` 请求遵循环境变量代理
+- `HTTP_PROXY`: 上游出站 HTTP 代理，例如 `http://127.0.0.1:7892`
+- `HTTPS_PROXY`: 上游出站 HTTPS 代理，例如 `http://127.0.0.1:7892`
+- `NO_PROXY`: 不走代理的地址白名单，例如 `127.0.0.1,localhost`
 
 示例：
 
@@ -333,6 +337,10 @@ SHIM_API_KEY=replace-with-your-own-secret
 DEFAULT_MODEL=gpt-5.4
 STRIP_FIELDS=audio
 DEBUG_CAPTURE_DIR=
+NODE_USE_ENV_PROXY=1
+HTTP_PROXY=http://127.0.0.1:7892
+HTTPS_PROXY=http://127.0.0.1:7892
+NO_PROXY=127.0.0.1,localhost
 ```
 
 ## 本地运行
@@ -354,6 +362,82 @@ PM2 配置同样会透传这些变量：
 
 - `STRIP_FIELDS`
 - `DEBUG_CAPTURE_DIR`
+- `NODE_USE_ENV_PROXY`
+- `HTTP_PROXY`
+- `HTTPS_PROXY`
+- `NO_PROXY`
+
+## 服务器通过机场代理访问上游
+
+如果你的服务器直连 `gmncode.cn` 很慢，但本机还好，最稳的办法不是改协议层，而是让服务器的出站请求先走本地代理。
+
+推荐做法：
+
+- 服务器运行 `mihomo` core，而不是运行 `Clash Verge Rev` 图形客户端
+- `mihomo` 使用订阅拉取节点
+- 本地暴露一个代理端口，例如 `127.0.0.1:7892`
+- shim 通过 `NODE_USE_ENV_PROXY=1` + `HTTP_PROXY` / `HTTPS_PROXY` 访问上游
+
+原因：
+
+- `Clash Verge Rev` 是桌面 GUI 客户端，不适合无头服务器
+- 当前这个项目使用的是 Node 内置 `http` / `https`
+- 从 Node.js `v22.21.0` 开始，可以通过 `NODE_USE_ENV_PROXY=1` 让内置网络请求遵循环境变量代理
+
+相关参考：
+
+- Node.js 企业网络配置文档：<https://nodejs.org/en/learn/http/enterprise-network-configuration>
+- Mihomo service 文档：<https://wiki.metacubex.one/en/startup/service/>
+- Mihomo proxy-providers 文档：<https://wiki.metacubex.one/en/config/proxy-providers/>
+
+### 1. 准备 Mihomo 配置
+
+仓库内提供了一个样板文件：
+
+- [deploy/mihomo/config.yaml.example](./deploy/mihomo/config.yaml.example)
+
+把其中的订阅地址替换成你自己的订阅链接。
+
+### 2. 验证代理是否真的加速
+
+在服务器上先验证 `mihomo` 本地代理本身能正常访问上游：
+
+```bash
+curl -x http://127.0.0.1:7892 -I https://gmncode.cn/
+```
+
+如果这条请求比直连明显更稳或更快，再让 shim 挂上代理。
+
+### 3. 让 shim 走本地代理
+
+把 `.env` 配成类似这样：
+
+```bash
+PORT=8787
+TARGET_BASE_URL=https://gmncode.cn/v1
+TARGET_API_KEY=sk-xxxx
+SHIM_API_KEY=replace-with-your-own-secret
+DEFAULT_MODEL=gpt-5.4
+STRIP_FIELDS=audio
+DEBUG_CAPTURE_DIR=
+NODE_USE_ENV_PROXY=1
+HTTP_PROXY=http://127.0.0.1:7892
+HTTPS_PROXY=http://127.0.0.1:7892
+NO_PROXY=127.0.0.1,localhost
+```
+
+### 4. systemd 方式部署
+
+仓库内提供了一个 systemd 样板：
+
+- [systemd/openai-compat-shim.service.example](./systemd/openai-compat-shim.service.example)
+
+要点：
+
+- `After=mihomo.service`，确保代理 core 先起来
+- `EnvironmentFile=/etc/openai-compat-shim.env`
+- `NODE_USE_ENV_PROXY=1`
+- `HTTP_PROXY` / `HTTPS_PROXY` 指向本地 `mihomo` 端口
 
 ## 请求示例
 
@@ -498,6 +582,25 @@ DEBUG_CAPTURE_DIR=/path/to/captures
    - 客户端请求格式
    - shim 适配逻辑
    - 上游兼容性
+   - 服务器出站网络质量
+
+### 5. 网络层排查顺序
+
+如果服务器上表现明显比本机差，优先排查网络层，不要先怀疑 agent 协议。
+
+顺序如下：
+
+1. 服务器直连 `gmncode.cn` 测一次
+2. 服务器通过 `mihomo` 本地代理再测一次
+3. 对比 `time_total`、握手耗时和首包耗时
+4. 只有在网络层差异不明显时，才继续看 shim 抓包
+
+示例：
+
+```bash
+curl -o /dev/null -s -w 'direct dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\n' https://gmncode.cn/v1/models
+curl -o /dev/null -s -x http://127.0.0.1:7892 -w 'proxy  dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\n' https://gmncode.cn/v1/models
+```
 
 ## 部署拓扑
 
