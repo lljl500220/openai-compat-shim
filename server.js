@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { URL } from "node:url";
 
 const PORT = Number(process.env.PORT || 8787);
@@ -477,6 +478,13 @@ function makeChunkFromTemplate(template, choice) {
   };
 }
 
+function collectChoiceToolKeys(toolOrder, toolStates, choiceIndex) {
+  return toolOrder.filter((key) => {
+    const state = toolStates.get(key);
+    return state && state.choiceIndex === choiceIndex && !state.flushed;
+  });
+}
+
 // 流式返回更麻烦：tool_calls 可能被拆在多个 SSE chunk 里，
 // 所以要先聚合 name/arguments，再按客户端能消费的方式重新拼回去。
 function transformChatCompletionSse(text, customToolNames) {
@@ -915,10 +923,231 @@ async function proxyJson(req, res, pathname) {
       customToolNames.size > 0;
 
     if (shouldTransformStream) {
-      // custom tool 的 SSE 分片需要先读完整再重写，否则客户端可能拿到不完整 arguments。
+      // custom tool 的参数分片会被上游拆散，这里按 SSE event 增量聚合并重写，
+      // 保留普通文本的实时透传，避免重新退化成“整段缓冲后再一次性返回”。
+      res.writeHead(upstreamResponse.status, {
+        "Content-Type": upstreamResponse.headers["content-type"] || "text/event-stream; charset=utf-8",
+        "Cache-Control": upstreamResponse.headers["cache-control"] || "no-cache",
+        Connection: upstreamResponse.headers.connection || "keep-alive",
+        "X-Accel-Buffering": "no"
+      });
+      if (typeof res.flushHeaders === "function") {
+        res.flushHeaders();
+      }
+
       const streamedChunks = [];
+      const transformedChunks = [];
+      const decoder = new StringDecoder("utf8");
+      let pendingText = "";
+      let templateChunk = null;
+      let sawDone = false;
+      const toolStates = new Map();
+      const toolOrder = [];
+
+      const writeTransformed = (text) => {
+        transformedChunks.push(text);
+        if (!clientClosed) {
+          res.write(text);
+        }
+      };
+
+      const writeJsonEvent = (payload) => {
+        writeTransformed(`data: ${JSON.stringify(payload)}\n\n`);
+      };
+
+      const flushChoiceToolStates = (choiceIndex, finishReason) => {
+        for (const key of collectChoiceToolKeys(toolOrder, toolStates, choiceIndex)) {
+          const state = toolStates.get(key);
+          if (!state) continue;
+          state.flushed = true;
+          const args = unwrapCustomToolArguments(state.name, state.arguments, customToolNames);
+          writeJsonEvent(
+            makeChunkFromTemplate(templateChunk, {
+              index: state.choiceIndex,
+              delta: {
+                tool_calls: [
+                  {
+                    index: state.toolIndex,
+                    id: state.id,
+                    type: state.type,
+                    function: {
+                      name: state.name,
+                      arguments: ""
+                    }
+                  }
+                ]
+              },
+              finish_reason: null
+            })
+          );
+
+          if (args) {
+            writeJsonEvent(
+              makeChunkFromTemplate(templateChunk, {
+                index: state.choiceIndex,
+                delta: {
+                  tool_calls: [
+                    {
+                      index: state.toolIndex,
+                      function: {
+                        name: "",
+                        arguments: args
+                      }
+                    }
+                  ]
+                },
+                finish_reason: null
+              })
+            );
+          }
+        }
+
+        if (finishReason != null) {
+          writeJsonEvent(
+            makeChunkFromTemplate(templateChunk, {
+              index: choiceIndex,
+              delta: { content: "" },
+              finish_reason: finishReason
+            })
+          );
+        }
+      };
+
+      const flushRemainingToolStates = () => {
+        const pendingChoiceIndexes = new Set();
+        for (const key of toolOrder) {
+          const state = toolStates.get(key);
+          if (state && !state.flushed) {
+            pendingChoiceIndexes.add(state.choiceIndex);
+          }
+        }
+        for (const choiceIndex of pendingChoiceIndexes) {
+          flushChoiceToolStates(choiceIndex, null);
+        }
+      };
+
+      const processSseEvent = (eventText) => {
+        if (!eventText) return;
+
+        if (!eventText.startsWith("data: ")) {
+          writeTransformed(`${eventText}\n\n`);
+          return;
+        }
+
+        const data = eventText.slice("data: ".length);
+        if (data === "[DONE]") {
+          flushRemainingToolStates();
+          sawDone = true;
+          writeTransformed("data: [DONE]\n\n");
+          return;
+        }
+
+        const payload = tryParseJson(data);
+        if (!payload) {
+          writeTransformed(`${eventText}\n\n`);
+          return;
+        }
+
+        if (payload?.object !== "chat.completion.chunk" || !Array.isArray(payload.choices)) {
+          writeJsonEvent(payload);
+          return;
+        }
+
+        if (!templateChunk) {
+          templateChunk = payload;
+        }
+
+        if (payload.choices.length === 0) {
+          writeJsonEvent(payload);
+          return;
+        }
+
+        const cloned = cloneJson(payload);
+        const keptChoices = [];
+        const finishReasons = [];
+
+        for (const choice of cloned.choices) {
+          const choiceIndex = choice?.index ?? 0;
+          const delta = choice?.delta;
+
+          if (Array.isArray(delta?.tool_calls)) {
+            for (const toolDelta of delta.tool_calls) {
+              const toolIndex = toolDelta?.index ?? 0;
+              const key = `${choiceIndex}:${toolIndex}`;
+              let state = toolStates.get(key);
+              if (!state) {
+                state = {
+                  choiceIndex,
+                  toolIndex,
+                  id: "",
+                  type: "function",
+                  name: "",
+                  arguments: "",
+                  flushed: false
+                };
+                toolStates.set(key, state);
+                toolOrder.push(key);
+              }
+
+              if (typeof toolDelta?.id === "string" && toolDelta.id) {
+                state.id = toolDelta.id;
+              }
+              if (typeof toolDelta?.type === "string" && toolDelta.type) {
+                state.type = toolDelta.type;
+              }
+              if (typeof toolDelta?.function?.name === "string" && toolDelta.function.name) {
+                state.name += toolDelta.function.name;
+              }
+              if (typeof toolDelta?.function?.arguments === "string") {
+                state.arguments += toolDelta.function.arguments;
+              }
+            }
+          }
+
+          if (delta && typeof delta === "object") {
+            delete delta.tool_calls;
+          }
+
+          const hasDelta =
+            delta &&
+            typeof delta === "object" &&
+            Object.keys(delta).length > 0 &&
+            !(Object.keys(delta).length === 1 && delta.content === "");
+
+          if (hasDelta && choice?.finish_reason == null) {
+            keptChoices.push(choice);
+          }
+
+          if (choice?.finish_reason != null) {
+            finishReasons.push({
+              choiceIndex,
+              finishReason: choice.finish_reason
+            });
+          }
+        }
+
+        if (keptChoices.length > 0) {
+          cloned.choices = keptChoices;
+          writeJsonEvent(cloned);
+        }
+
+        for (const { choiceIndex, finishReason } of finishReasons) {
+          flushChoiceToolStates(choiceIndex, finishReason);
+        }
+      };
+
       upstreamResponse.stream.on("data", (chunk) => {
-        streamedChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+        streamedChunks.push(buffer);
+        pendingText += decoder.write(buffer);
+
+        let separatorIndex = pendingText.indexOf("\n\n");
+        while (separatorIndex >= 0) {
+          const eventText = pendingText.slice(0, separatorIndex);
+          pendingText = pendingText.slice(separatorIndex + 2);
+          processSseEvent(eventText);
+          separatorIndex = pendingText.indexOf("\n\n");
+        }
       });
       upstreamResponse.stream.on("error", (error) => {
         logEvent({
@@ -930,8 +1159,16 @@ async function proxyJson(req, res, pathname) {
         res.destroy(error);
       });
       upstreamResponse.stream.on("end", () => {
+        pendingText += decoder.end();
+        if (pendingText) {
+          processSseEvent(pendingText);
+          pendingText = "";
+        }
+        if (!sawDone) {
+          flushRemainingToolStates();
+        }
         const upstreamBody = Buffer.concat(streamedChunks).toString("utf8");
-        const transformedBody = transformChatCompletionSse(upstreamBody, customToolNames);
+        const transformedBody = transformedChunks.join("");
         writeDebugCapture({
           ...captureBase,
           streamed: true,
@@ -947,14 +1184,9 @@ async function proxyJson(req, res, pathname) {
             message: error.message
           });
         });
-        if (clientClosed) return;
-        res.writeHead(upstreamResponse.status, {
-          "Content-Type": upstreamResponse.headers["content-type"] || "text/event-stream; charset=utf-8",
-          "Cache-Control": upstreamResponse.headers["cache-control"] || "no-cache",
-          Connection: upstreamResponse.headers.connection || "keep-alive",
-          "X-Accel-Buffering": "no"
-        });
-        res.end(transformedBody);
+        if (!clientClosed) {
+          res.end();
+        }
       });
       return;
     }
