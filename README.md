@@ -122,6 +122,8 @@ The shim treats a request as streaming when one of these is true:
 
 When streaming is enabled, the upstream stream is piped directly back to the client.
 
+For production reverse proxies such as Nginx, disable proxy buffering for `/v1/` routes; otherwise SSE clients such as Cursor may time out before they receive the first event.
+
 ### 5. Debug capture
 
 When `DEBUG_CAPTURE_DIR` is set, the shim writes one JSON file per request containing:
@@ -322,6 +324,8 @@ Environment variables:
 - `DEFAULT_MODEL`: fallback model exposed by `/v1/models`
 - `STRIP_FIELDS`: comma-separated top-level request fields to remove before proxying
 - `DEBUG_CAPTURE_DIR`: directory for full request/response capture files
+- `ENABLE_STREAM_TOOL_TRANSFORM`: set to `1` only if you explicitly need streamed custom-tool argument rewriting; default off because it buffers the full SSE before replying
+- `UPSTREAM_REQUEST_TIMEOUT_MS`: upstream POST timeout in milliseconds, default `300000`
 - `NODE_USE_ENV_PROXY`: set to `1` so built-in Node.js `http` / `https` requests honor proxy environment variables
 - `HTTP_PROXY`: outbound HTTP proxy, for example `http://127.0.0.1:7892`
 - `HTTPS_PROXY`: outbound HTTPS proxy, for example `http://127.0.0.1:7892`
@@ -337,6 +341,8 @@ SHIM_API_KEY=replace-with-your-own-secret
 DEFAULT_MODEL=gpt-5.4
 STRIP_FIELDS=audio
 DEBUG_CAPTURE_DIR=
+ENABLE_STREAM_TOOL_TRANSFORM=0
+UPSTREAM_REQUEST_TIMEOUT_MS=300000
 NODE_USE_ENV_PROXY=1
 HTTP_PROXY=http://127.0.0.1:7892
 HTTPS_PROXY=http://127.0.0.1:7892

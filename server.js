@@ -14,6 +14,8 @@ const STRIP_FIELDS = String(process.env.STRIP_FIELDS || "audio")
   .map((field) => field.trim())
   .filter(Boolean);
 const DEBUG_CAPTURE_DIR = process.env.DEBUG_CAPTURE_DIR || "";
+const ENABLE_STREAM_TOOL_TRANSFORM = process.env.ENABLE_STREAM_TOOL_TRANSFORM === "1";
+const UPSTREAM_REQUEST_TIMEOUT_MS = Number(process.env.UPSTREAM_REQUEST_TIMEOUT_MS || 300000);
 
 // 这个 shim 的核心职责是把客户端发来的近似 OpenAI 请求，
 // 适配成上游网关更稳定能接受的格式，再把响应按兼容预期返回。
@@ -808,6 +810,41 @@ async function proxyJson(req, res, pathname) {
   });
 
   let upstreamResponse;
+  let upstreamReq = null;
+  let upstreamStream = null;
+  let clientClosed = false;
+
+  const abortUpstream = (reason) => {
+    if (upstreamStream && !upstreamStream.destroyed) {
+      upstreamStream.destroy(new Error(reason));
+    }
+    if (upstreamReq && !upstreamReq.destroyed) {
+      upstreamReq.destroy(new Error(reason));
+    }
+  };
+
+  req.on("aborted", () => {
+    clientClosed = true;
+    logEvent({
+      phase: "client_aborted",
+      method: req.method,
+      path: pathname
+    });
+    abortUpstream("Client aborted request");
+  });
+
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      clientClosed = true;
+      logEvent({
+        phase: "client_closed",
+        method: req.method,
+        path: pathname
+      });
+      abortUpstream("Client closed response");
+    }
+  });
+
   try {
     upstreamResponse = await new Promise((resolve, reject) => {
       const requestBody = JSON.stringify(payload);
@@ -824,7 +861,8 @@ async function proxyJson(req, res, pathname) {
         }
       };
       const transport = upstreamUrl.protocol === "https:" ? https : http;
-      const upstreamReq = transport.request(options, (upstreamRes) => {
+      upstreamReq = transport.request(options, (upstreamRes) => {
+        upstreamStream = upstreamRes;
         if (wantsStream) {
           resolve({
             status: upstreamRes.statusCode || 502,
@@ -844,11 +882,17 @@ async function proxyJson(req, res, pathname) {
           });
         });
       });
+      upstreamReq.setTimeout(UPSTREAM_REQUEST_TIMEOUT_MS, () => {
+        upstreamReq.destroy(new Error(`Upstream request timed out after ${UPSTREAM_REQUEST_TIMEOUT_MS}ms`));
+      });
       upstreamReq.on("error", reject);
       upstreamReq.write(requestBody);
       upstreamReq.end();
     });
   } catch (error) {
+    if (clientClosed) {
+      return;
+    }
     return sendJson(res, 502, {
       error: {
         message: `Upstream request failed: ${error.message}`,
@@ -866,7 +910,9 @@ async function proxyJson(req, res, pathname) {
       streamed: true
     });
     const shouldTransformStream =
-      pathname.endsWith("/chat/completions") && customToolNames.size > 0;
+      ENABLE_STREAM_TOOL_TRANSFORM &&
+      pathname.endsWith("/chat/completions") &&
+      customToolNames.size > 0;
 
     if (shouldTransformStream) {
       // custom tool 的 SSE 分片需要先读完整再重写，否则客户端可能拿到不完整 arguments。
@@ -901,10 +947,12 @@ async function proxyJson(req, res, pathname) {
             message: error.message
           });
         });
+        if (clientClosed) return;
         res.writeHead(upstreamResponse.status, {
           "Content-Type": upstreamResponse.headers["content-type"] || "text/event-stream; charset=utf-8",
           "Cache-Control": upstreamResponse.headers["cache-control"] || "no-cache",
-          Connection: upstreamResponse.headers.connection || "keep-alive"
+          Connection: upstreamResponse.headers.connection || "keep-alive",
+          "X-Accel-Buffering": "no"
         });
         res.end(transformedBody);
       });
@@ -915,8 +963,12 @@ async function proxyJson(req, res, pathname) {
     res.writeHead(upstreamResponse.status, {
       "Content-Type": upstreamResponse.headers["content-type"] || "text/event-stream; charset=utf-8",
       "Cache-Control": upstreamResponse.headers["cache-control"] || "no-cache",
-      Connection: upstreamResponse.headers.connection || "keep-alive"
+      Connection: upstreamResponse.headers.connection || "keep-alive",
+      "X-Accel-Buffering": "no"
     });
+    if (typeof res.flushHeaders === "function") {
+      res.flushHeaders();
+    }
     const streamedChunks = [];
     upstreamResponse.stream.on("data", (chunk) => {
       streamedChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));

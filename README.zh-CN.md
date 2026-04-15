@@ -122,6 +122,8 @@ OpenAI 兼容上游
 
 启用流式后，上游流会被直接透传回客户端。
 
+如果前面还有 Nginx 之类的反向代理，请为 `/v1/` 路由关闭代理缓冲；否则 Cursor 这类 SSE 客户端可能会在收到首个事件前就先超时断开。
+
 ### 5. 调试抓取
 
 当设置了 `DEBUG_CAPTURE_DIR` 时，shim 会为每个请求写入一个 JSON 文件，其中包含：
@@ -322,6 +324,8 @@ cp .env.example .env
 - `DEFAULT_MODEL`: `/v1/models` 暴露的默认回退模型名
 - `STRIP_FIELDS`: 代理前需要剥离的顶层请求字段，多个值用逗号分隔
 - `DEBUG_CAPTURE_DIR`: 保存完整请求/响应抓取文件的目录
+- `ENABLE_STREAM_TOOL_TRANSFORM`: 只有在你明确需要“流式 custom tool 参数重写”时才设为 `1`；默认关闭，因为这会在回复前先缓冲整段 SSE
+- `UPSTREAM_REQUEST_TIMEOUT_MS`: 上游 POST 超时时间，单位毫秒，默认 `300000`
 - `NODE_USE_ENV_PROXY`: 设为 `1` 后，Node.js 会让内置 `http` / `https` 请求遵循环境变量代理
 - `HTTP_PROXY`: 上游出站 HTTP 代理，例如 `http://127.0.0.1:7892`
 - `HTTPS_PROXY`: 上游出站 HTTPS 代理，例如 `http://127.0.0.1:7892`
@@ -337,6 +341,8 @@ SHIM_API_KEY=replace-with-your-own-secret
 DEFAULT_MODEL=gpt-5.4
 STRIP_FIELDS=audio
 DEBUG_CAPTURE_DIR=
+ENABLE_STREAM_TOOL_TRANSFORM=0
+UPSTREAM_REQUEST_TIMEOUT_MS=300000
 NODE_USE_ENV_PROXY=1
 HTTP_PROXY=http://127.0.0.1:7892
 HTTPS_PROXY=http://127.0.0.1:7892
